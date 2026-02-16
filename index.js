@@ -28,8 +28,8 @@ if (!fs.existsSync(uploadDir)) {
     fs.mkdirSync(uploadDir);
 }
 
-// MongoDB Connection (Optional: Only if URI provided)
-if (process.env.MONGODB_URI) {
+// MongoDB Connection (Optional: Only if real URI provided)
+if (process.env.MONGODB_URI && process.env.MONGODB_URI.startsWith('mongodb')) {
     mongoose.connect(process.env.MONGODB_URI)
         .then(() => console.log('MongoDB Connected'))
         .catch(err => console.log('MongoDB Connection Error:', err));
@@ -106,8 +106,11 @@ app.post('/api/generate', uploadFields, async (req, res) => {
             colorLight = '#ffffff',
             moduleStyle = 'square',
             eyeStyle = 'square',
-            logoSize = 20 // percent
+            logoSize = 20, // percent
+            showText = 'false'
         } = req.body;
+
+        const shouldShowText = showText === 'true' || showText === true;
 
         // Process Data
         // Assume first row might be header. We'll check if it looks like a header or data.
@@ -180,7 +183,7 @@ app.post('/api/generate', uploadFields, async (req, res) => {
         res.attachment('qrcodes.zip');
 
         const archive = archiver('zip', {
-            zlib: { level: 9 } // Sets the compression level.
+            zlib: { level: 1 } // Level 1 is much faster than 9 with similar results for small images
         });
 
         archive.on('error', function (err) {
@@ -216,180 +219,178 @@ app.post('/api/generate', uploadFields, async (req, res) => {
 
         archive.append(reportContent, { name: 'report.txt' });
 
-        // Generate QRs and append to zip
-        for (const serial of validRecords) {
+        // Pre-calculate common values
+        const qrWidth = parseInt(width);
+        const marginInt = parseInt(margin);
+        const textHeight = Math.max(40, Math.floor(qrWidth * 0.15));
+        const fontSize = Math.floor(textHeight * 0.4);
+        const lSize = Math.floor(qrWidth * (parseInt(logoSize) / 100));
+
+        // Global Sharp settings for bulk
+        sharp.simd(true);
+        sharp.concurrency(0); // Use all available cores
+
+        // Pre-process Logo once if available
+        let logoBg = null;
+        let logoResized = null;
+        if (logoPath) {
+            logoBg = await sharp({
+                create: {
+                    width: lSize + 10,
+                    height: lSize + 10,
+                    channels: 4,
+                    background: colorLight
+                }
+            }).png().toBuffer();
+
+            logoResized = await sharp(logoPath)
+                .resize(lSize, lSize, { fit: 'contain', background: { r: 0, g: 0, b: 0, alpha: 0 } })
+                .toBuffer();
+        }
+
+        // Processing Function
+        const processRecord = async (serial) => {
             const data = serial;
-
-            // Generate QR Buffer
-            // We use 'jpeg' format as requested.
-            // qrcode lib defaults to png. 'toDataURL' supports image/jpeg.
-            // 'toBuffer' supports png not jpeg directly usually, let's see.
-            // Documentation says: toBuffer(text, [options], [cb]) - png by default.
-            // We might need to convert or just save as png.
-            // Prompt says: "Save each QR code as JPEG (.jpg) format."
-            // QRCode npm can output to canvas, then to DataURL jpeg.
-            // Or use toBuffer with type 'png' (default) and just name it .jpg? No, that's bad.
-            // toDataURL('text', { type: 'image/jpeg' }) works.
-
             let buffer;
 
-            // If styling is default square, use standard lib for speed
-            if (moduleStyle === 'square' && eyeStyle === 'square') {
-                const url = await QRCode.toDataURL(data, {
-                    width: parseInt(width),
-                    margin: parseInt(margin),
-                    errorCorrectionLevel: errorCorrectionLevel,
-                    type: format === 'png' ? 'image/png' : 'image/jpeg',
-                    color: {
-                        dark: colorDark,
-                        light: colorLight
-                    },
-                    rendererOpts: {
-                        quality: 0.92
-                    }
-                });
-                buffer = Buffer.from(url.split(',')[1], 'base64');
+            if (moduleStyle === 'square' && eyeStyle === 'square' && !logoPath && !shouldShowText) {
+                // Fastest path: Standard lib only
+                // If PNG, use toBuffer directly (faster than toDataURL)
+                if (format === 'png') {
+                    return await QRCode.toBuffer(data, {
+                        width: qrWidth,
+                        margin: marginInt,
+                        errorCorrectionLevel: errorCorrectionLevel,
+                        color: { dark: colorDark, light: colorLight }
+                    });
+                } else {
+                    const url = await QRCode.toDataURL(data, {
+                        width: qrWidth,
+                        margin: marginInt,
+                        errorCorrectionLevel: errorCorrectionLevel,
+                        type: 'image/jpeg',
+                        color: { dark: colorDark, light: colorLight },
+                        rendererOpts: { quality: 0.90 }
+                    });
+                    return Buffer.from(url.split(',')[1], 'base64');
+                }
             } else {
-                // Custom Styling Logic using SVG + Sharp
+                // Custom path or logo/text needed
                 const qrData = QRCode.create(data, { errorCorrectionLevel });
                 const modules = qrData.modules.data;
                 const size = qrData.modules.size;
-                const marginInt = parseInt(margin);
-                // Calculate scale to fit requested width
-                // Total cells = size + 2*margin (approx if we treat margin as cells, but usually margin is pixels/modules)
-                // Let's standardise: we draw the QR at 'size' coordinate system, then user margin.
 
-                // cellSize. we want final image to be `width`.
-                // Viewbox size = size.
-                const cellSize = 10; // Arbitrary high res
-                const totalSize = (size * cellSize) + (marginInt * 2 * cellSize); // Margin as equivalent modules
-                // Actually easier: Draw SVG 1x1 per module, set ViewBox.
-
-                // Identify Finder Patterns (Corners)
-                // Top-Left: (0,0) to (6,6)
-                // Top-Right: (size-7, 0) to (size-1, 6)
-                // Bottom-Left: (0, size-7) to (6, size-1)
                 const isFinder = (r, c) => {
-                    if (r < 7 && c < 7) return true; // TL
-                    if (r < 7 && c >= size - 7) return true; // TR
-                    if (r >= size - 7 && c < 7) return true; // BL
+                    if (r < 7 && c < 7) return true;
+                    if (r < 7 && c >= size - 7) return true;
+                    if (r >= size - 7 && c < 7) return true;
                     return false;
                 };
 
-                let svgPath = '';
-                // Draw Background
-                let svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${size} ${size}" width="${width}" height="${width}" shape-rendering="crispEdges">`;
-                svg += `<rect width="100%" height="100%" fill="${colorLight}"/>`;
+                const shapes = [];
 
-                // Group for foreground
-                let pathD = '';
-                let pathDots = ''; // For dots (circles)
-
-                for (let r = 0; r < size; r++) {
-                    for (let c = 0; c < size; c++) {
-                        if (modules[r * size + c]) {
-                            const isF = isFinder(r, c);
-
-                            // Module Logic
-                            if (!isF) {
-                                if (moduleStyle === 'rounded') {
-                                    // CSS-style rect with radius
-                                    // In SVG path, we can't easily mix rects. We can use <rect>.
-                                    // Better to append strings for shapes.
-                                }
-                            }
-                        }
+                // Draw Eye Patterns (Finders)
+                const eyes = [{ r: 0, c: 0 }, { r: 0, c: size - 7 }, { r: size - 7, c: 0 }];
+                for (const eye of eyes) {
+                    if (eyeStyle === 'rounded') {
+                        // Outer
+                        shapes.push(`<rect x="${eye.c}" y="${eye.r}" width="7" height="7" rx="1.5" fill="${colorDark}" />`);
+                        // Hole
+                        shapes.push(`<rect x="${eye.c + 1}" y="${eye.r + 1}" width="5" height="5" rx="1" fill="${colorLight}" />`);
+                        // Inner
+                        shapes.push(`<rect x="${eye.c + 2}" y="${eye.r + 2}" width="3" height="3" rx="0.5" fill="${colorDark}" />`);
+                    } else {
+                        // Square
+                        shapes.push(`<rect x="${eye.c}" y="${eye.r}" width="7" height="7" fill="${colorDark}" />`);
+                        shapes.push(`<rect x="${eye.c + 1}" y="${eye.r + 1}" width="5" height="5" fill="${colorLight}" />`);
+                        shapes.push(`<rect x="${eye.c + 2}" y="${eye.r + 2}" width="3" height="3" fill="${colorDark}" />`);
                     }
                 }
 
-                // Re-think: String concat is faster than objects.
-                let shapes = '';
-
+                // Draw remaining modules
                 for (let r = 0; r < size; r++) {
+                    const rowOffset = r * size;
                     for (let c = 0; c < size; c++) {
-                        if (modules[r * size + c]) {
-                            const isF = isFinder(r, c);
+                        if (isFinder(r, c)) continue; // Skip finder areas
 
-                            // 1. Finder Styling
-                            if (isF) {
-                                if (eyeStyle === 'rounded') {
-                                    // Draw rounded rect/circle for finders?
-                                    // A simple finder is 7x7 dark, 5x5 light, 3x3 dark.
-                                    // We are iterating pixels, so we just draw them.
-                                    // If we want "Rounded Eyes", usually the outer box (7x7) is rounded.
-                                    // Handling pixel-by-pixel rounded eyes is hard unless we detect the block.
-                                    // Simple approach: Render Finders as squares for now even if 'rounded' requested, 
-                                    // OR render individual pixels as circles/rounded.
-                                    // Let's stick to module style for finders if eyeStyle matches moduleStyle.
-                                    // Best "Eye Style" implementation manually draws the 3 large squares.
-                                    // For this iteration: just Apply 'moduleStyle' to everything if easy, or treat standard.
-
-                                    // Let's apply moduleStyle to finders too for consistency unless special.
-                                    // If EyeStyle is Rounded, we want the whole 7x7 block to look like a rounded square.
-                                    // That requires knowing we are in a finder and NOT drawing per-pixel.
-                                    // Complex. Let's fallback: Draw Finders as Squares always, or apply pixel style.
-
-                                    // User Request: "Shapes and patterns".
-                                    // Let's implement:
-                                    // dots: All modules are circles.
-                                    // rounded: All modules are rects with rx.
-                                }
-                            }
-
-                            // Drawing Logic
-                            const shapeStyle = isF && eyeStyle === 'square' ? 'square' : moduleStyle;
-
-                            if (shapeStyle === 'dots') {
-                                shapes += `<circle cx="${c + 0.5}" cy="${r + 0.5}" r="0.4" fill="${colorDark}" />`;
-                            } else if (shapeStyle === 'rounded') {
-                                shapes += `<rect x="${c + 0.1}" y="${r + 0.1}" width="0.8" height="0.8" rx="0.2" fill="${colorDark}" />`;
+                        if (modules[rowOffset + c]) {
+                            if (moduleStyle === 'dots') {
+                                shapes.push(`<circle cx="${c + 0.5}" cy="${r + 0.5}" r="0.4" fill="${colorDark}" />`);
+                            } else if (moduleStyle === 'rounded') {
+                                shapes.push(`<rect x="${c + 0.1}" y="${r + 0.1}" width="0.8" height="0.8" rx="0.2" fill="${colorDark}" />`);
                             } else {
-                                // Square
-                                shapes += `<rect x="${c}" y="${r}" width="1" height="1" fill="${colorDark}" />`;
+                                shapes.push(`<rect x="${c}" y="${r}" width="1" height="1" fill="${colorDark}" />`);
                             }
                         }
                     }
                 }
 
-                svg += shapes + `</svg>`;
+                const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${size} ${size}" width="${qrWidth}" height="${qrWidth}" shape-rendering="crispEdges">
+                    <rect width="100%" height="100%" fill="${colorLight}"/>
+                    ${shapes.join('')}
+                </svg>`;
 
-                // Convert SVG to Buffer using Sharp
                 let sharpInstance = sharp(Buffer.from(svg));
 
-                // Add Logo Composite if available
                 if (logoPath) {
-                    const qrWidth = parseInt(width);
-                    const lSize = Math.floor(qrWidth * (parseInt(logoSize) / 100));
-
-                    // Create a white background for the logo
-                    const logoBg = await sharp({
-                        create: {
-                            width: lSize + 10,
-                            height: lSize + 10,
-                            channels: 4,
-                            background: colorLight
-                        }
-                    }).png().toBuffer();
-
-                    const logoResized = await sharp(logoPath)
-                        .resize(lSize, lSize, { fit: 'contain', background: { r: 0, g: 0, b: 0, alpha: 0 } })
-                        .toBuffer();
-
                     sharpInstance = sharpInstance.composite([
                         { input: logoBg, gravity: 'center' },
                         { input: logoResized, gravity: 'center' }
                     ]);
                 }
 
-                if (format === 'png') {
-                    buffer = await sharpInstance.png().toBuffer();
+                if (shouldShowText) {
+                    const escapedSerial = String(serial)
+                        .replace(/&/g, '&amp;')
+                        .replace(/</g, '&lt;')
+                        .replace(/>/g, '&gt;')
+                        .replace(/"/g, '&quot;')
+                        .replace(/'/g, '&apos;');
+
+                    const textSvg = `<svg width="${qrWidth}" height="${textHeight}">
+                        <rect width="100%" height="100%" fill="${colorLight}" />
+                        <text x="50%" y="50%" font-family="Arial" font-size="${fontSize}" fill="${colorDark}" text-anchor="middle" dominant-baseline="middle" font-weight="bold">${escapedSerial}</text>
+                    </svg>`;
+
+                    buffer = await sharpInstance
+                        .extend({
+                            bottom: textHeight,
+                            background: colorLight
+                        })
+                        .composite([
+                            { input: Buffer.from(textSvg), gravity: 'south' }
+                        ])
+                        .toFormat(format === 'png' ? 'png' : 'jpeg', { quality: 90 })
+                        .toBuffer();
                 } else {
-                    buffer = await sharpInstance.jpeg({ quality: 90 }).toBuffer();
+                    buffer = await sharpInstance
+                        .toFormat(format === 'png' ? 'png' : 'jpeg', { quality: 90 })
+                        .toBuffer();
+                }
+                return buffer;
+            }
+        };
+
+        // Parallel processing with high concurrency limit
+        const CONCURRENCY_LIMIT = 50;
+        for (let i = 0; i < validRecords.length; i += CONCURRENCY_LIMIT) {
+            const chunk = validRecords.slice(i, i + CONCURRENCY_LIMIT);
+            const results = await Promise.all(chunk.map(async (serial) => {
+                try {
+                    const buf = await processRecord(serial);
+                    return { serial, buf };
+                } catch (err) {
+                    console.error(`Error processing ${serial}:`, err);
+                    return null;
+                }
+            }));
+
+            for (const res of results) {
+                if (res) {
+                    const ext = format === 'png' ? 'png' : 'jpg';
+                    archive.append(res.buf, { name: `${res.serial}.${ext}` });
                 }
             }
-
-            const ext = format === 'png' ? 'png' : 'jpg';
-            archive.append(buffer, { name: `${serial}.${ext}` });
         }
 
         archive.finalize();
