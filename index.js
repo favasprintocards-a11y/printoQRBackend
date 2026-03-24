@@ -107,7 +107,8 @@ app.post('/api/generate', uploadFields, async (req, res) => {
             moduleStyle = 'square',
             eyeStyle = 'square',
             logoSize = 20, // percent
-            showText = 'false'
+            showText = 'false',
+            textFontSize = null
         } = req.body;
 
         const shouldShowText = showText === 'true' || showText === true;
@@ -222,8 +223,8 @@ app.post('/api/generate', uploadFields, async (req, res) => {
         // Pre-calculate common values
         const qrWidth = parseInt(width);
         const marginInt = parseInt(margin);
-        const textHeight = Math.max(40, Math.floor(qrWidth * 0.15));
-        const fontSize = Math.floor(textHeight * 0.4);
+        const fontSize = textFontSize ? parseInt(textFontSize) : Math.floor(Math.max(40, Math.floor(qrWidth * 0.15)) * 0.4);
+        const textHeight = Math.max(Math.floor(qrWidth * 0.15), Math.floor(fontSize * 2.5));
         const lSize = Math.floor(qrWidth * (parseInt(logoSize) / 100));
 
         // Global Sharp settings for bulk
