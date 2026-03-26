@@ -10,6 +10,10 @@ const mongoose = require('mongoose');
 const sharp = require('sharp');
 require('dotenv').config();
 
+// Optimization: Global Sharp settings
+sharp.concurrency(1);
+sharp.simd(true);
+
 const app = express();
 const PORT = process.env.PORT || 5000;
 
@@ -167,7 +171,8 @@ app.post('/api/generate', uploadFields, async (req, res) => {
         res.set('X-Skipped-Count', String(errors.length));
         res.attachment(`qrcodes_${Date.now()}.zip`);
 
-        const archive = archiver('zip', { zlib: { level: 1 } });
+        // Optimization: Use level 0 (STORE) to save CPU as images are already compressed
+        const archive = archiver('zip', { zlib: { level: 0 } });
         archive.on('error', (err) => res.status(500).send({ error: err.message }));
         archive.on('end', () => {
              console.log(`ZIP complete. Total time: ${Date.now() - startOverall}ms`);
@@ -194,19 +199,20 @@ app.post('/api/generate', uploadFields, async (req, res) => {
         const marginInt = parseInt(margin);
         const fontSize = textFontSize ? parseInt(textFontSize) : Math.floor(Math.max(40, Math.floor(qrWidth * 0.15)) * 0.4);
         const textHeight = Math.max(Math.floor(qrWidth * 0.15), Math.floor(fontSize * 2.5));
-        const lSize = Math.floor(qrWidth * (parseInt(logoSize) / 100));
 
-        // Use concurrency 1 for Sharp because we handle parallelization in JS
-        sharp.concurrency(1); 
-        sharp.simd(true);
-
-        let logoBg = null, logoResized = null;
+        // Pre-process logo as base64 for embedding in SVG
+        let logoDataUri = null;
         if (logoPath) {
-            logoBg = await sharp({ create: { width: lSize + 10, height: lSize + 10, channels: 4, background: colorLight } }).png().toBuffer();
-            logoResized = await sharp(logoPath).resize(lSize, lSize, { fit: 'contain', background: { r:0, g:0, b:0, alpha:0 } }).toBuffer();
+            const lSize = Math.floor(qrWidth * (parseInt(logoSize) / 100));
+            const logoResizedBuf = await sharp(logoPath)
+                .resize(lSize, lSize, { fit: 'contain', background: { r:0, g:0, b:0, alpha:0 } })
+                .png() // Ensure it's PNG for the data URI
+                .toBuffer();
+            logoDataUri = `data:image/png;base64,${logoResizedBuf.toString('base64')}`;
         }
 
         const processRecord = async (serial) => {
+            // Fast path for simple square QR
             if (moduleStyle === 'square' && eyeStyle === 'square' && !logoPath && !shouldShowText) {
                 if (format === 'png') {
                     return await QRCode.toBuffer(serial, { width: qrWidth, margin: marginInt, errorCorrectionLevel, color: { dark: colorDark, light: colorLight } });
@@ -215,14 +221,16 @@ app.post('/api/generate', uploadFields, async (req, res) => {
                     return Buffer.from(url.split(',')[1], 'base64');
                 }
             } else {
+                // Optimized path: Single SVG render for customized styles/logos/text
                 const qrData = QRCode.create(serial, { errorCorrectionLevel });
                 const { modules, size } = qrData.modules;
+                const totalQRSize = size + 2 * marginInt;
                 const shapes = [];
                 const isFinder = (r, c) => (r < 7 && c < 7) || (r < 7 && c >= size - 7) || (r >= size - 7 && c < 7);
                 
                 const eyes = [{ r: 0, c: 0 }, { r: 0, c: size - 7 }, { r: size - 7, c: 0 }];
                 for (const eye of eyes) {
-                    const rect = (r, c, w, h, rx, f) => `<rect x="${c}" y="${r}" width="${w}" height="${h}" ${rx ? `rx="${rx}"` : ''} fill="${f}" />`;
+                    const rect = (r, c, w, h, rx, f) => `<rect x="${c + marginInt}" y="${r + marginInt}" width="${w}" height="${h}" ${rx ? `rx="${rx}"` : ''} fill="${f}" />`;
                     if (eyeStyle === 'rounded') {
                         shapes.push(rect(eye.r, eye.c, 7, 7, 1.5, colorDark), rect(eye.r+1, eye.c+1, 5, 5, 1, colorLight), rect(eye.r+2, eye.c+2, 3, 3, 0.5, colorDark));
                     } else {
@@ -234,27 +242,42 @@ app.post('/api/generate', uploadFields, async (req, res) => {
                     for (let c = 0; c < size; c++) {
                         if (isFinder(r, c)) continue;
                         if (qrData.modules.get(r, c)) {
-                            if (moduleStyle === 'dots') shapes.push(`<circle cx="${c + 0.5}" cy="${r + 0.5}" r="0.4" fill="${colorDark}" />`);
-                            else if (moduleStyle === 'rounded') shapes.push(`<rect x="${c + 0.1}" y="${r + 0.1}" width="0.8" height="0.8" rx="0.2" fill="${colorDark}" />`);
-                            else shapes.push(`<rect x="${c}" y="${r}" width="1" height="1" fill="${colorDark}" />`);
+                            if (moduleStyle === 'dots') shapes.push(`<circle cx="${c + marginInt + 0.5}" cy="${r + marginInt + 0.5}" r="0.4" fill="${colorDark}" />`);
+                            else if (moduleStyle === 'rounded') shapes.push(`<rect x="${c + marginInt + 0.1}" y="${r + marginInt + 0.1}" width="0.8" height="0.8" rx="0.2" fill="${colorDark}" />`);
+                            else shapes.push(`<rect x="${c + marginInt}" y="${r + marginInt}" width="1" height="1" fill="${colorDark}" />`);
                         }
                     }
                 }
 
-                const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${size} ${size}" width="${qrWidth}" height="${qrWidth}" shape-rendering="crispEdges"><rect width="100%" height="100%" fill="${colorLight}"/>${shapes.join('')}</svg>`;
-                let sharpInstance = sharp(Buffer.from(svg));
-                if (logoPath) sharpInstance = sharpInstance.composite([{ input: logoBg, gravity: 'center' }, { input: logoResized, gravity: 'center' }]);
+                const unitRatio = totalQRSize / qrWidth;
+                const textHeightUnits = textHeight * unitRatio;
+                const totalHeightUnits = shouldShowText ? totalQRSize + textHeightUnits : totalQRSize;
+                
+                let extraElements = [];
+                if (logoDataUri) {
+                    const lSizeUnits = (parseInt(logoSize) / 100) * size;
+                    const lPos = marginInt + (size - lSizeUnits) / 2;
+                    // Background for logo to ensure it's readable
+                    extraElements.push(`<rect x="${lPos - 0.2}" y="${lPos - 0.2}" width="${lSizeUnits + 0.4}" height="${lSizeUnits + 0.4}" fill="${colorLight}" />`);
+                    extraElements.push(`<image x="${lPos}" y="${lPos}" width="${lSizeUnits}" height="${lSizeUnits}" href="${logoDataUri}" />`);
+                }
 
                 if (shouldShowText) {
                     const escaped = String(serial).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-                    const textSvg = `<svg width="${qrWidth}" height="${textHeight}"><rect width="100%" height="100%" fill="${colorLight}" /><text x="50%" y="50%" font-family="Arial" font-size="${fontSize}" fill="${colorDark}" text-anchor="middle" dominant-baseline="middle" font-weight="bold">${escaped}</text></svg>`;
-                    return await sharpInstance.extend({ bottom: textHeight, background: colorLight }).composite([{ input: Buffer.from(textSvg), gravity: 'south' }]).toFormat(format === 'png' ? 'png' : 'jpeg', { quality: 90 }).toBuffer();
+                    const textYUnits = totalQRSize + (textHeightUnits / 2);
+                    const fontSizeUnits = fontSize * unitRatio;
+                    extraElements.push(`<text x="${totalQRSize / 2}" y="${textYUnits}" font-family="Arial, Helvetica, sans-serif" font-size="${fontSizeUnits}" fill="${colorDark}" text-anchor="middle" dominant-baseline="middle" font-weight="bold">${escaped}</text>`);
                 }
-                return await sharpInstance.toFormat(format === 'png' ? 'png' : 'jpeg', { quality: 90 }).toBuffer();
+
+                const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${totalQRSize} ${totalHeightUnits}" width="${qrWidth}" height="${shouldShowText ? qrWidth + textHeight : qrWidth}" shape-rendering="crispEdges"><rect width="100%" height="100%" fill="${colorLight}"/>${shapes.join('')}${extraElements.join('')}</svg>`;
+                
+                return await sharp(Buffer.from(svg))
+                    .toFormat(format === 'png' ? 'png' : 'jpeg', { quality: 90 })
+                    .toBuffer();
             }
         };
 
-        const CONCURRENCY_LIMIT = 40; // Slightly lower for better stability
+        const CONCURRENCY_LIMIT = 20; // Optimized for stability on typical multi-core CPUs
         for (let i = 0; i < validRecords.length; i += CONCURRENCY_LIMIT) {
             const chunk = validRecords.slice(i, i + CONCURRENCY_LIMIT);
             const results = await Promise.all(chunk.map(async (serial) => {
