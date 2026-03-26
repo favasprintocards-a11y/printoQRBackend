@@ -83,6 +83,7 @@ const uploadFields = upload.fields([
 app.post('/api/generate', uploadFields, async (req, res) => {
     let filePath = null;
     let logoPath = null;
+    const startOverall = Date.now();
     try {
         if (!req.files || !req.files['file']) {
             return res.status(400).json({ error: 'No data file uploaded' });
@@ -90,79 +91,63 @@ app.post('/api/generate', uploadFields, async (req, res) => {
 
         filePath = req.files['file'][0].path;
         logoPath = req.files['logo'] ? req.files['logo'][0].path : null;
-        const workbook = xlsx.readFile(filePath);
+        
+        console.log(`Starting generation from file: ${req.files['file'][0].originalname}`);
+        
+        const workbook = xlsx.readFile(filePath, { cellFormula: false, cellHTML: false, cellText: false });
         const sheetName = workbook.SheetNames[0];
         const sheet = workbook.Sheets[sheetName];
-        const rawData = xlsx.utils.sheet_to_json(sheet, { header: 1 });
-
+        
         // Configuration
         const {
             width = 300,
             margin = 4,
             errorCorrectionLevel = 'M',
-            colIndex = 0, // Default to first column
+            colIndex = 0,
             format = 'jpeg',
             colorDark = '#000000',
             colorLight = '#ffffff',
             moduleStyle = 'square',
             eyeStyle = 'square',
-            logoSize = 20, // percent
+            logoSize = 20,
             showText = 'false',
             textFontSize = null
         } = req.body;
 
+        const targetCol = parseInt(colIndex);
         const shouldShowText = showText === 'true' || showText === true;
-
-        // Process Data
-        // Assume first row might be header. We'll check if it looks like a header or data.
-        // For simplicity, let's assume if the user selects a column, we process all rows. 
-        // Or we can let user specify if header exists. 
-        // Let's assume row 1 is header if it's string and looks like a name.
-        // We'll just filter valid rows.
-
+        
+        // Efficient record extraction instead of full sheet_to_json
+        const range = xlsx.utils.decode_range(sheet['!ref'] || 'A1');
         const validRecords = [];
         const errors = [];
         const seen = new Set();
+        
+        for (let r = range.s.r; r <= range.e.r; r++) {
+            const cellAddr = xlsx.utils.encode_cell({ r, c: targetCol });
+            const cell = sheet[cellAddr];
+            const serial = cell ? cell.v : null;
 
-        // Skip header if needed. For now, we process all non-empty cells in the selected column.
-        // If the first item is "Serial Number", skip it.
-        let startIndex = 0;
-        if (rawData.length > 0 && typeof rawData[0][colIndex] === 'string' && isNaN(rawData[0][colIndex])) {
-            // lenient check for header
-            // But valid serials can be strings.
-            // Let's just create a list and if the user sees 'Serial' as a QR, they'll know.
-            // Better: Use a "hasHeader" flag from frontend? Or just process everything.
-        }
-
-        for (let i = startIndex; i < rawData.length; i++) {
-            const row = rawData[i];
-            const serial = row[colIndex];
-
-            if (serial === undefined || serial === null || serial === '') {
-                errors.push({ row: i + 1, error: 'Empty value' });
+            if (serial === undefined || serial === null || String(serial).trim() === '') {
+                // If it's a completely empty row, just skip silently
+                if (cell === undefined) continue;
+                errors.push({ row: r + 1, error: 'Empty value' });
                 continue;
             }
 
             const serialStr = String(serial).trim();
-
-            // Duplicate Check
             if (seen.has(serialStr)) {
-                errors.push({ row: i + 1, error: 'Duplicate serial', value: serialStr });
+                errors.push({ row: r + 1, error: 'Duplicate serial', value: serialStr });
                 continue;
             }
             seen.add(serialStr);
-
-            // Validation (Basic alphanumeric + safe chars)
-            // if (!/^[a-zA-Z0-9\-_]+$/.test(serialStr)) { 
-            //     // Relaxed validation: Just warn or skip?
-            //     // Prompt says "Validate: Invalid characters". Let's assume strictly safe for filenames if we use them as filenames.
-            // }
-
             validRecords.push(serialStr);
         }
 
+        console.log(`Extracted ${validRecords.length} records. Analysis took ${Date.now() - startOverall}ms`);
+
         if (validRecords.length === 0) {
-            if (filePath) fs.unlinkSync(filePath); // Cleanup
+            if (filePath && fs.existsSync(filePath)) fs.unlinkSync(filePath);
             return res.status(400).json({ error: 'No valid records found in the selected column.' });
         }
 
@@ -175,29 +160,20 @@ app.post('/api/generate', uploadFields, async (req, res) => {
             }).save().catch(err => console.error(err));
         }
 
-        // Set Headers for ZIP Download
+        // Set Headers
         res.set('Access-Control-Expose-Headers', 'X-Total-Count, X-Success-Count, X-Skipped-Count, Content-Disposition');
-        res.set('X-Total-Count', String(rawData.length - startIndex));
+        res.set('X-Total-Count', String(range.e.r - range.s.r + 1));
         res.set('X-Success-Count', String(validRecords.length));
         res.set('X-Skipped-Count', String(errors.length));
+        res.attachment(`qrcodes_${Date.now()}.zip`);
 
-        res.attachment('qrcodes.zip');
-
-        const archive = archiver('zip', {
-            zlib: { level: 1 } // Level 1 is much faster than 9 with similar results for small images
-        });
-
-        archive.on('error', function (err) {
-            res.status(500).send({ error: err.message });
-        });
-
-        // Cleanup on finish
+        const archive = archiver('zip', { zlib: { level: 1 } });
+        archive.on('error', (err) => res.status(500).send({ error: err.message }));
         archive.on('end', () => {
-            if (filePath && fs.existsSync(filePath)) fs.unlinkSync(filePath);
-            if (logoPath && fs.existsSync(logoPath)) fs.unlinkSync(logoPath);
+             console.log(`ZIP complete. Total time: ${Date.now() - startOverall}ms`);
+             if (filePath && fs.existsSync(filePath)) fs.unlinkSync(filePath);
+             if (logoPath && fs.existsSync(logoPath)) fs.unlinkSync(logoPath);
         });
-
-        // If client closes connection
         res.on('close', () => {
             if (filePath && fs.existsSync(filePath)) fs.unlinkSync(filePath);
             if (logoPath && fs.existsSync(logoPath)) fs.unlinkSync(logoPath);
@@ -205,239 +181,132 @@ app.post('/api/generate', uploadFields, async (req, res) => {
 
         archive.pipe(res);
 
-        // Generate Report
-        let reportContent = `Generation Report\n=================\n`;
-        reportContent += `Total Rows Processed: ${rawData.length - startIndex}\n`;
-        reportContent += `Successful: ${validRecords.length}\n`;
-        reportContent += `Skipped/Errors: ${errors.length}\n\n`;
-
+        // Report
+        let reportContent = `Generation Report\n=================\nTotal Records Found: ${validRecords.length}\nSkipped/Errors: ${errors.length}\nAnalysis Time: ${Date.now() - startOverall}ms\n\n`;
         if (errors.length > 0) {
             reportContent += `Error Details:\n`;
-            errors.forEach(err => {
-                reportContent += `Row ${err.row}: ${err.error} (Value: "${err.value || ''}")\n`;
-            });
+            errors.slice(0, 100).forEach(err => reportContent += `Row ${err.row}: ${err.error} (Value: "${err.value || ''}")\n`);
+            if (errors.length > 100) reportContent += `...and ${errors.length - 100} more errors.\n`;
         }
-
         archive.append(reportContent, { name: 'report.txt' });
 
-        // Pre-calculate common values
         const qrWidth = parseInt(width);
         const marginInt = parseInt(margin);
         const fontSize = textFontSize ? parseInt(textFontSize) : Math.floor(Math.max(40, Math.floor(qrWidth * 0.15)) * 0.4);
         const textHeight = Math.max(Math.floor(qrWidth * 0.15), Math.floor(fontSize * 2.5));
         const lSize = Math.floor(qrWidth * (parseInt(logoSize) / 100));
 
-        // Global Sharp settings for bulk
+        // Use concurrency 1 for Sharp because we handle parallelization in JS
+        sharp.concurrency(1); 
         sharp.simd(true);
-        sharp.concurrency(0); // Use all available cores
 
-        // Pre-process Logo once if available
-        let logoBg = null;
-        let logoResized = null;
+        let logoBg = null, logoResized = null;
         if (logoPath) {
-            logoBg = await sharp({
-                create: {
-                    width: lSize + 10,
-                    height: lSize + 10,
-                    channels: 4,
-                    background: colorLight
-                }
-            }).png().toBuffer();
-
-            logoResized = await sharp(logoPath)
-                .resize(lSize, lSize, { fit: 'contain', background: { r: 0, g: 0, b: 0, alpha: 0 } })
-                .toBuffer();
+            logoBg = await sharp({ create: { width: lSize + 10, height: lSize + 10, channels: 4, background: colorLight } }).png().toBuffer();
+            logoResized = await sharp(logoPath).resize(lSize, lSize, { fit: 'contain', background: { r:0, g:0, b:0, alpha:0 } }).toBuffer();
         }
 
-        // Processing Function
         const processRecord = async (serial) => {
-            const data = serial;
-            let buffer;
-
             if (moduleStyle === 'square' && eyeStyle === 'square' && !logoPath && !shouldShowText) {
-                // Fastest path: Standard lib only
-                // If PNG, use toBuffer directly (faster than toDataURL)
                 if (format === 'png') {
-                    return await QRCode.toBuffer(data, {
-                        width: qrWidth,
-                        margin: marginInt,
-                        errorCorrectionLevel: errorCorrectionLevel,
-                        color: { dark: colorDark, light: colorLight }
-                    });
+                    return await QRCode.toBuffer(serial, { width: qrWidth, margin: marginInt, errorCorrectionLevel, color: { dark: colorDark, light: colorLight } });
                 } else {
-                    const url = await QRCode.toDataURL(data, {
-                        width: qrWidth,
-                        margin: marginInt,
-                        errorCorrectionLevel: errorCorrectionLevel,
-                        type: 'image/jpeg',
-                        color: { dark: colorDark, light: colorLight },
-                        rendererOpts: { quality: 0.90 }
-                    });
+                    const url = await QRCode.toDataURL(serial, { width: qrWidth, margin: marginInt, errorCorrectionLevel, type: 'image/jpeg', color: { dark: colorDark, light: colorLight }, rendererOpts: { quality: 0.9 } });
                     return Buffer.from(url.split(',')[1], 'base64');
                 }
             } else {
-                // Custom path or logo/text needed
-                const qrData = QRCode.create(data, { errorCorrectionLevel });
-                const modules = qrData.modules.data;
-                const size = qrData.modules.size;
-
-                const isFinder = (r, c) => {
-                    if (r < 7 && c < 7) return true;
-                    if (r < 7 && c >= size - 7) return true;
-                    if (r >= size - 7 && c < 7) return true;
-                    return false;
-                };
-
+                const qrData = QRCode.create(serial, { errorCorrectionLevel });
+                const { modules, size } = qrData.modules;
                 const shapes = [];
-
-                // Draw Eye Patterns (Finders)
+                const isFinder = (r, c) => (r < 7 && c < 7) || (r < 7 && c >= size - 7) || (r >= size - 7 && c < 7);
+                
                 const eyes = [{ r: 0, c: 0 }, { r: 0, c: size - 7 }, { r: size - 7, c: 0 }];
                 for (const eye of eyes) {
+                    const rect = (r, c, w, h, rx, f) => `<rect x="${c}" y="${r}" width="${w}" height="${h}" ${rx ? `rx="${rx}"` : ''} fill="${f}" />`;
                     if (eyeStyle === 'rounded') {
-                        // Outer
-                        shapes.push(`<rect x="${eye.c}" y="${eye.r}" width="7" height="7" rx="1.5" fill="${colorDark}" />`);
-                        // Hole
-                        shapes.push(`<rect x="${eye.c + 1}" y="${eye.r + 1}" width="5" height="5" rx="1" fill="${colorLight}" />`);
-                        // Inner
-                        shapes.push(`<rect x="${eye.c + 2}" y="${eye.r + 2}" width="3" height="3" rx="0.5" fill="${colorDark}" />`);
+                        shapes.push(rect(eye.r, eye.c, 7, 7, 1.5, colorDark), rect(eye.r+1, eye.c+1, 5, 5, 1, colorLight), rect(eye.r+2, eye.c+2, 3, 3, 0.5, colorDark));
                     } else {
-                        // Square
-                        shapes.push(`<rect x="${eye.c}" y="${eye.r}" width="7" height="7" fill="${colorDark}" />`);
-                        shapes.push(`<rect x="${eye.c + 1}" y="${eye.r + 1}" width="5" height="5" fill="${colorLight}" />`);
-                        shapes.push(`<rect x="${eye.c + 2}" y="${eye.r + 2}" width="3" height="3" fill="${colorDark}" />`);
+                        shapes.push(rect(eye.r, eye.c, 7, 7, 0, colorDark), rect(eye.r+1, eye.c+1, 5, 5, 0, colorLight), rect(eye.r+2, eye.c+2, 3, 3, 0, colorDark));
                     }
                 }
 
-                // Draw remaining modules
                 for (let r = 0; r < size; r++) {
-                    const rowOffset = r * size;
                     for (let c = 0; c < size; c++) {
-                        if (isFinder(r, c)) continue; // Skip finder areas
-
-                        if (modules[rowOffset + c]) {
-                            if (moduleStyle === 'dots') {
-                                shapes.push(`<circle cx="${c + 0.5}" cy="${r + 0.5}" r="0.4" fill="${colorDark}" />`);
-                            } else if (moduleStyle === 'rounded') {
-                                shapes.push(`<rect x="${c + 0.1}" y="${r + 0.1}" width="0.8" height="0.8" rx="0.2" fill="${colorDark}" />`);
-                            } else {
-                                shapes.push(`<rect x="${c}" y="${r}" width="1" height="1" fill="${colorDark}" />`);
-                            }
+                        if (isFinder(r, c)) continue;
+                        if (qrData.modules.get(r, c)) {
+                            if (moduleStyle === 'dots') shapes.push(`<circle cx="${c + 0.5}" cy="${r + 0.5}" r="0.4" fill="${colorDark}" />`);
+                            else if (moduleStyle === 'rounded') shapes.push(`<rect x="${c + 0.1}" y="${r + 0.1}" width="0.8" height="0.8" rx="0.2" fill="${colorDark}" />`);
+                            else shapes.push(`<rect x="${c}" y="${r}" width="1" height="1" fill="${colorDark}" />`);
                         }
                     }
                 }
 
-                const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${size} ${size}" width="${qrWidth}" height="${qrWidth}" shape-rendering="crispEdges">
-                    <rect width="100%" height="100%" fill="${colorLight}"/>
-                    ${shapes.join('')}
-                </svg>`;
-
+                const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${size} ${size}" width="${qrWidth}" height="${qrWidth}" shape-rendering="crispEdges"><rect width="100%" height="100%" fill="${colorLight}"/>${shapes.join('')}</svg>`;
                 let sharpInstance = sharp(Buffer.from(svg));
-
-                if (logoPath) {
-                    sharpInstance = sharpInstance.composite([
-                        { input: logoBg, gravity: 'center' },
-                        { input: logoResized, gravity: 'center' }
-                    ]);
-                }
+                if (logoPath) sharpInstance = sharpInstance.composite([{ input: logoBg, gravity: 'center' }, { input: logoResized, gravity: 'center' }]);
 
                 if (shouldShowText) {
-                    const escapedSerial = String(serial)
-                        .replace(/&/g, '&amp;')
-                        .replace(/</g, '&lt;')
-                        .replace(/>/g, '&gt;')
-                        .replace(/"/g, '&quot;')
-                        .replace(/'/g, '&apos;');
-
-                    const textSvg = `<svg width="${qrWidth}" height="${textHeight}">
-                        <rect width="100%" height="100%" fill="${colorLight}" />
-                        <text x="50%" y="50%" font-family="Arial" font-size="${fontSize}" fill="${colorDark}" text-anchor="middle" dominant-baseline="middle" font-weight="bold">${escapedSerial}</text>
-                    </svg>`;
-
-                    buffer = await sharpInstance
-                        .extend({
-                            bottom: textHeight,
-                            background: colorLight
-                        })
-                        .composite([
-                            { input: Buffer.from(textSvg), gravity: 'south' }
-                        ])
-                        .toFormat(format === 'png' ? 'png' : 'jpeg', { quality: 90 })
-                        .toBuffer();
-                } else {
-                    buffer = await sharpInstance
-                        .toFormat(format === 'png' ? 'png' : 'jpeg', { quality: 90 })
-                        .toBuffer();
+                    const escaped = String(serial).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+                    const textSvg = `<svg width="${qrWidth}" height="${textHeight}"><rect width="100%" height="100%" fill="${colorLight}" /><text x="50%" y="50%" font-family="Arial" font-size="${fontSize}" fill="${colorDark}" text-anchor="middle" dominant-baseline="middle" font-weight="bold">${escaped}</text></svg>`;
+                    return await sharpInstance.extend({ bottom: textHeight, background: colorLight }).composite([{ input: Buffer.from(textSvg), gravity: 'south' }]).toFormat(format === 'png' ? 'png' : 'jpeg', { quality: 90 }).toBuffer();
                 }
-                return buffer;
+                return await sharpInstance.toFormat(format === 'png' ? 'png' : 'jpeg', { quality: 90 }).toBuffer();
             }
         };
 
-        // Parallel processing with high concurrency limit
-        const CONCURRENCY_LIMIT = 50;
+        const CONCURRENCY_LIMIT = 40; // Slightly lower for better stability
         for (let i = 0; i < validRecords.length; i += CONCURRENCY_LIMIT) {
             const chunk = validRecords.slice(i, i + CONCURRENCY_LIMIT);
             const results = await Promise.all(chunk.map(async (serial) => {
-                try {
-                    const buf = await processRecord(serial);
-                    return { serial, buf };
-                } catch (err) {
-                    console.error(`Error processing ${serial}:`, err);
-                    return null;
-                }
+                try { return { serial, buf: await processRecord(serial) }; }
+                catch (err) { console.error(`Error ${serial}:`, err); return null; }
             }));
-
             for (const res of results) {
-                if (res) {
-                    const ext = format === 'png' ? 'png' : 'jpg';
-                    archive.append(res.buf, { name: `${res.serial}.${ext}` });
-                }
+                if (res) archive.append(res.buf, { name: `${res.serial}.${format === 'png' ? 'png' : 'jpg'}` });
             }
         }
-
         archive.finalize();
 
     } catch (error) {
-        console.error(error);
-        if (filePath && fs.existsSync(filePath)) {
-            fs.unlinkSync(filePath);
-        }
-        if (!res.headersSent) {
-            res.status(500).json({ error: 'Server error processing file.' });
-        }
+        console.error('Generation Error:', error);
+        if (filePath && fs.existsSync(filePath)) fs.unlinkSync(filePath);
+        if (!res.headersSent) res.status(500).json({ error: 'Server error processing file.' });
     }
 });
 
-// Endpoint to just preview/analyze file
 app.post('/api/analyze', uploadFields, (req, res) => {
     let filePath = null;
+    const startTime = Date.now();
     try {
-        if (!req.files || !req.files['file']) {
-            return res.status(400).json({ error: 'No data file uploaded' });
-        }
+        if (!req.files || !req.files['file']) return res.status(400).json({ error: 'No data file uploaded' });
         filePath = req.files['file'][0].path;
-        const workbook = xlsx.readFile(filePath);
-        const sheetName = workbook.SheetNames[0];
-        const sheet = workbook.Sheets[sheetName];
-        const data = xlsx.utils.sheet_to_json(sheet, { header: 1 });
+        
+        const workbook = xlsx.readFile(filePath, { cellFormula: false, cellHTML: false, cellText: false });
+        const sheet = workbook.Sheets[workbook.SheetNames[0]];
+        const range = xlsx.utils.decode_range(sheet['!ref'] || 'A1');
+        
+        const totalRows = range.e.r - range.s.r + 1;
+        const preview = [];
+        const maxPreview = Math.min(range.s.r + 5, range.e.r + 1);
+        
+        // Extract only needed rows for preview
+        for (let r = range.s.r; r < maxPreview; r++) {
+            const row = [];
+            for (let c = range.s.c; c <= range.e.c; c++) {
+                const cell = sheet[xlsx.utils.encode_cell({ r, c })];
+                row.push(cell ? cell.v : '');
+            }
+            preview.push(row);
+        }
 
-        // Return first 5 rows and total count, and columns
-        const totalRows = data.length;
-        const preview = data.slice(0, 5);
-
-        // Assuming header might be row 0
-        const headers = data.length > 0 ? data[0] : [];
-
-        // We don't delete yet? Or we rely on client to re-upload for generation?
-        // Stateless is better. Delete now. Client uploads again for generation.
+        const headers = preview.length > 0 ? preview[0] : [];
         fs.unlinkSync(filePath);
-
-        res.json({
-            totalRows,
-            preview,
-            headers
-        });
+        
+        console.log(`Analysis complete for ${totalRows} rows in ${Date.now() - startTime}ms`);
+        res.json({ totalRows, preview, headers, analysisTime: Date.now() - startTime });
 
     } catch (err) {
+        console.error('Analysis error:', err);
         if (filePath && fs.existsSync(filePath)) fs.unlinkSync(filePath);
         res.status(500).json({ error: 'Failed to parse Excel file' });
     }
