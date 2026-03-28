@@ -202,6 +202,11 @@ app.post('/api/generate', uploadFields, async (req, res) => {
         const fontSize = textFontSize ? parseInt(textFontSize) : Math.floor(Math.max(40, Math.floor(qrWidth * 0.15)) * 0.4);
         const textHeight = Math.max(Math.floor(qrWidth * 0.15), Math.floor(fontSize * 2.5));
 
+        let actualColorLight = colorLight;
+        if (colorLight === 'transparent') {
+            actualColorLight = format === 'png' ? 'transparent' : '#ffffff';
+        }
+
         // Pre-process logo as base64 for embedding in SVG
         let logoDataUri = null;
         if (logoPath) {
@@ -217,9 +222,9 @@ app.post('/api/generate', uploadFields, async (req, res) => {
             // Fast path for simple square QR
             if (moduleStyle === 'square' && eyeStyle === 'square' && !logoPath && !shouldShowText) {
                 if (format === 'png') {
-                    return await QRCode.toBuffer(serial, { width: qrWidth, margin: marginInt, errorCorrectionLevel, color: { dark: colorDark, light: colorLight } });
+                    return await QRCode.toBuffer(serial, { width: qrWidth, margin: marginInt, errorCorrectionLevel, color: { dark: colorDark, light: actualColorLight === 'transparent' ? '#ffffff00' : actualColorLight } });
                 } else {
-                    const url = await QRCode.toDataURL(serial, { width: qrWidth, margin: marginInt, errorCorrectionLevel, type: 'image/jpeg', color: { dark: colorDark, light: colorLight }, rendererOpts: { quality: 0.9 } });
+                    const url = await QRCode.toDataURL(serial, { width: qrWidth, margin: marginInt, errorCorrectionLevel, type: 'image/jpeg', color: { dark: colorDark, light: actualColorLight }, rendererOpts: { quality: 0.9 } });
                     return Buffer.from(url.split(',')[1], 'base64');
                 }
             } else {
@@ -262,7 +267,8 @@ app.post('/api/generate', uploadFields, async (req, res) => {
                     const lSizeUnits = (parseInt(logoSize) / 100) * size;
                     const lPos = marginInt + (size - lSizeUnits) / 2;
                     // Background for logo to ensure it's readable
-                    extraElements.push(`<rect x="${lPos - 0.2}" y="${lPos - 0.2}" width="${lSizeUnits + 0.4}" height="${lSizeUnits + 0.4}" fill="${colorLight}" />`);
+                    const safeLogoBg = actualColorLight === 'transparent' ? '#ffffff' : actualColorLight;
+                    extraElements.push(`<rect x="${lPos - 0.2}" y="${lPos - 0.2}" width="${lSizeUnits + 0.4}" height="${lSizeUnits + 0.4}" fill="${safeLogoBg}" />`);
                     extraElements.push(`<image x="${lPos}" y="${lPos}" width="${lSizeUnits}" height="${lSizeUnits}" href="${logoDataUri}" />`);
                 }
 
@@ -285,7 +291,7 @@ app.post('/api/generate', uploadFields, async (req, res) => {
                 }
 
                 const qrOutputHeight = shouldShowText ? qrWidth + textHeight + textSpaceInt : qrWidth;
-                const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${totalQRSize} ${totalHeightUnits}" width="${qrWidth}" height="${qrOutputHeight}" shape-rendering="crispEdges"><rect width="100%" height="100%" fill="${colorLight}"/>${shapes.join('')}${extraElements.join('')}</svg>`;
+                const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${totalQRSize} ${totalHeightUnits}" width="${qrWidth}" height="${qrOutputHeight}" shape-rendering="crispEdges"><rect width="100%" height="100%" fill="${actualColorLight}"/>${shapes.join('')}${extraElements.join('')}</svg>`;
                 
                 return await sharp(Buffer.from(svg))
                     .toFormat(format === 'png' ? 'png' : 'jpeg', format === 'png' ? {} : { quality: 90 })
