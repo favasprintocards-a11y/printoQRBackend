@@ -237,11 +237,12 @@ app.post('/api/generate', uploadFields, async (req, res) => {
                 
                 const eyes = [{ r: 0, c: 0 }, { r: 0, c: size - 7 }, { r: size - 7, c: 0 }];
                 for (const eye of eyes) {
-                    const rect = (r, c, w, h, rx, f) => `<rect x="${c + marginInt}" y="${r + marginInt}" width="${w}" height="${h}" ${rx ? `rx="${rx}"` : ''} fill="${f}" />`;
                     if (eyeStyle === 'rounded') {
-                        shapes.push(rect(eye.r, eye.c, 7, 7, 1.5, colorDark), rect(eye.r+1, eye.c+1, 5, 5, 1, colorLight), rect(eye.r+2, eye.c+2, 3, 3, 0.5, colorDark));
+                        shapes.push(`<rect x="${eye.c + marginInt + 0.5}" y="${eye.r + marginInt + 0.5}" width="6" height="6" rx="1.5" fill="none" stroke="${colorDark}" stroke-width="1" />`);
+                        shapes.push(`<rect x="${eye.c + marginInt + 2}" y="${eye.r + marginInt + 2}" width="3" height="3" rx="0.5" fill="${colorDark}" />`);
                     } else {
-                        shapes.push(rect(eye.r, eye.c, 7, 7, 0, colorDark), rect(eye.r+1, eye.c+1, 5, 5, 0, colorLight), rect(eye.r+2, eye.c+2, 3, 3, 0, colorDark));
+                        shapes.push(`<rect x="${eye.c + marginInt + 0.5}" y="${eye.r + marginInt + 0.5}" width="6" height="6" fill="none" stroke="${colorDark}" stroke-width="1" />`);
+                        shapes.push(`<rect x="${eye.c + marginInt + 2}" y="${eye.r + marginInt + 2}" width="3" height="3" fill="${colorDark}" />`);
                     }
                 }
 

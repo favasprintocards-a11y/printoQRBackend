@@ -1,8 +1,14 @@
-const sharp = require('sharp');
 const fs = require('fs');
-async function test() {
-    const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100"><rect width="100" height="100" fill="transparent"/><circle cx="50" cy="50" r="40" fill="red"/></svg>';
-    const buf = await sharp(Buffer.from(svg)).toFormat('png').toBuffer();
-    fs.writeFileSync('test-transparent.png', buf);
-}
-test().catch(console.error);
+
+const svg1 = `<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100" viewBox="0 0 10 10">
+    <rect x="0.5" y="0.5" width="6" height="6" fill="none" stroke="black" stroke-width="1" rx="1.5" />
+    <rect x="2" y="2" width="3" height="3" fill="red" rx="0.5" />
+</svg>`;
+
+const svg2 = `<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100" viewBox="0 0 10 10">
+    <rect x="0.5" y="0.5" width="6" height="6" fill="none" stroke="black" stroke-width="1" />
+    <rect x="2" y="2" width="3" height="3" fill="blue" />
+</svg>`;
+
+fs.writeFileSync('test-eye-rounded.svg', svg1);
+fs.writeFileSync('test-eye-square.svg', svg2);
