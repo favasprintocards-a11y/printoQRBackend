@@ -105,7 +105,7 @@ app.post('/api/generate', uploadFields, async (req, res) => {
         // Configuration
         const {
             width = 300,
-            margin = 4,
+            margin = 2,
             errorCorrectionLevel = 'M',
             colIndex = 0,
             format = 'jpeg',
