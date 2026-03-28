@@ -116,7 +116,7 @@ app.post('/api/generate', uploadFields, async (req, res) => {
             logoSize = 20,
             showText = 'false',
             textFontSize = null,
-            textAlign = 'center',
+            textX = 0,
             textSpace = 0
         } = req.body;
 
@@ -275,20 +275,12 @@ app.post('/api/generate', uploadFields, async (req, res) => {
 
                 if (shouldShowText) {
                     const escaped = String(serial).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-                    const textYUnits = totalQRSize + textSpaceUnits + ((textHeightUnits - textSpaceUnits) / 2);
+                    const textYUnits = totalQRSize + textSpaceUnits + ((textHeightUnits - Math.max(0, textSpaceUnits)) / 2);
                     const fontSizeUnits = fontSize * unitRatio;
                     
-                    let textAnchor = "middle";
-                    let textX = totalQRSize / 2;
-                    if (textAlign === 'left') {
-                       textAnchor = "start";
-                       textX = marginInt;
-                    } else if (textAlign === 'right') {
-                       textAnchor = "end";
-                       textX = totalQRSize - marginInt;
-                    }
+                    const textXPos = (totalQRSize / 2) + ((parseFloat(textX) || 0) * unitRatio);
                     
-                    extraElements.push(`<text x="${textX}" y="${textYUnits}" font-family="Arial, Helvetica, sans-serif" font-size="${fontSizeUnits}" fill="${colorDark}" text-anchor="${textAnchor}" dominant-baseline="middle" font-weight="bold">${escaped}</text>`);
+                    extraElements.push(`<text x="${textXPos}" y="${textYUnits}" font-family="Arial, Helvetica, sans-serif" font-size="${fontSizeUnits}" fill="${colorDark}" text-anchor="middle" dominant-baseline="middle" font-weight="bold">${escaped}</text>`);
                 }
 
                 const qrOutputHeight = shouldShowText ? qrWidth + textHeight + textSpaceInt : qrWidth;
