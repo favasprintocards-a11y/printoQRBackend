@@ -115,7 +115,9 @@ app.post('/api/generate', uploadFields, async (req, res) => {
             eyeStyle = 'square',
             logoSize = 20,
             showText = 'false',
-            textFontSize = null
+            textFontSize = null,
+            textAlign = 'center',
+            textSpace = 0
         } = req.body;
 
         const targetCol = parseInt(colIndex);
@@ -250,7 +252,9 @@ app.post('/api/generate', uploadFields, async (req, res) => {
                 }
 
                 const unitRatio = totalQRSize / qrWidth;
-                const textHeightUnits = textHeight * unitRatio;
+                const textSpaceInt = parseInt(textSpace) || 0;
+                const textSpaceUnits = textSpaceInt * unitRatio;
+                const textHeightUnits = (textHeight * unitRatio) + textSpaceUnits;
                 const totalHeightUnits = shouldShowText ? totalQRSize + textHeightUnits : totalQRSize;
                 
                 let extraElements = [];
@@ -264,15 +268,27 @@ app.post('/api/generate', uploadFields, async (req, res) => {
 
                 if (shouldShowText) {
                     const escaped = String(serial).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-                    const textYUnits = totalQRSize + (textHeightUnits / 2);
+                    const textYUnits = totalQRSize + textSpaceUnits + ((textHeightUnits - textSpaceUnits) / 2);
                     const fontSizeUnits = fontSize * unitRatio;
-                    extraElements.push(`<text x="${totalQRSize / 2}" y="${textYUnits}" font-family="Arial, Helvetica, sans-serif" font-size="${fontSizeUnits}" fill="${colorDark}" text-anchor="middle" dominant-baseline="middle" font-weight="bold">${escaped}</text>`);
+                    
+                    let textAnchor = "middle";
+                    let textX = totalQRSize / 2;
+                    if (textAlign === 'left') {
+                       textAnchor = "start";
+                       textX = marginInt;
+                    } else if (textAlign === 'right') {
+                       textAnchor = "end";
+                       textX = totalQRSize - marginInt;
+                    }
+                    
+                    extraElements.push(`<text x="${textX}" y="${textYUnits}" font-family="Arial, Helvetica, sans-serif" font-size="${fontSizeUnits}" fill="${colorDark}" text-anchor="${textAnchor}" dominant-baseline="middle" font-weight="bold">${escaped}</text>`);
                 }
 
-                const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${totalQRSize} ${totalHeightUnits}" width="${qrWidth}" height="${shouldShowText ? qrWidth + textHeight : qrWidth}" shape-rendering="crispEdges"><rect width="100%" height="100%" fill="${colorLight}"/>${shapes.join('')}${extraElements.join('')}</svg>`;
+                const qrOutputHeight = shouldShowText ? qrWidth + textHeight + textSpaceInt : qrWidth;
+                const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${totalQRSize} ${totalHeightUnits}" width="${qrWidth}" height="${qrOutputHeight}" shape-rendering="crispEdges"><rect width="100%" height="100%" fill="${colorLight}"/>${shapes.join('')}${extraElements.join('')}</svg>`;
                 
                 return await sharp(Buffer.from(svg))
-                    .toFormat(format === 'png' ? 'png' : 'jpeg', { quality: 90 })
+                    .toFormat(format === 'png' ? 'png' : 'jpeg', format === 'png' ? {} : { quality: 90 })
                     .toBuffer();
             }
         };
@@ -285,7 +301,10 @@ app.post('/api/generate', uploadFields, async (req, res) => {
                 catch (err) { console.error(`Error ${serial}:`, err); return null; }
             }));
             for (const res of results) {
-                if (res) archive.append(res.buf, { name: `${res.serial}.${format === 'png' ? 'png' : 'jpg'}` });
+                if (res) {
+                    const safeName = String(res.serial).replace(/[\/\\?%*:|"<>]/g, '-').trim();
+                    archive.append(res.buf, { name: `${safeName || 'qrcode'}.${format === 'png' ? 'png' : 'jpg'}` });
+                }
             }
         }
         archive.finalize();
