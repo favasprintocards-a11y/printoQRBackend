@@ -2,12 +2,10 @@
  * worker.js — High-Performance QR Worker Thread
  *
  * Optimisation strategy:
- *  1. FAST PATH  (square, no logo, no text) → raw PNG via `qrcode` SVG→manual bitmap.
- *     We use QRCode.create() (fast matrix generation) then build PNG bytes manually
- *     using pako deflate — avoids ALL Sharp overhead.
- *  2. CUSTOM PATH (rounded/dots/logo/text) → SVG string → Sharp (one Sharp call per QR).
- *
- * Workers run entirely off the main thread, true multi-core parallelism.
+ *  1. FAST PATH  (square, no logo, no text) → raw PNG via custom bitmap encoder.
+ *     Uses QRCode.create() (fast matrix) then builds PNG bytes manually
+ *     with Node's built-in zlib — zero Sharp overhead.
+ *  2. CUSTOM PATH (rounded/dots/logo/text) → SVG string → Sharp.
  */
 
 'use strict';
@@ -39,18 +37,21 @@ const {
     textSpace,
 } = workerData;
 
-// ─── Colour parsing helpers ───────────────────────────────────────────────
+const qrWidth = parseInt(width);
+
+// ─── Colour helpers ───────────────────────────────────────────────────────
 function hexToRgba(hex) {
-    hex = hex.replace('#', '');
+    hex = String(hex).replace('#', '');
     if (hex.length === 3) hex = hex.split('').map(c => c + c).join('');
-    const v = parseInt(hex, 16);
     if (hex.length === 8) {
-        return { r: (v >> 24) & 0xff, g: (v >> 16) & 0xff, b: (v >> 8) & 0xff, a: v & 0xff };
+        const v = parseInt(hex, 16);
+        return { r: (v >>> 24) & 0xff, g: (v >>> 16) & 0xff, b: (v >>> 8) & 0xff, a: v & 0xff };
     }
+    const v = parseInt(hex, 16);
     return { r: (v >> 16) & 0xff, g: (v >> 8) & 0xff, b: v & 0xff, a: 255 };
 }
 
-// ─── CRC32 table for PNG ──────────────────────────────────────────────────
+// ─── CRC32 for PNG chunks ─────────────────────────────────────────────────
 const crcTable = (() => {
     const t = new Uint32Array(256);
     for (let n = 0; n < 256; n++) {
@@ -73,68 +74,56 @@ function uint32be(v) {
 
 function pngChunk(type, data) {
     const typeBytes = Buffer.from(type, 'ascii');
-    const len = uint32be(data.length);
     const combined = Buffer.concat([typeBytes, data]);
-    const crc = uint32be(crc32(combined));
-    return Buffer.concat([len, typeBytes, data, crc]);
+    return Buffer.concat([uint32be(data.length), typeBytes, data, uint32be(crc32(combined))]);
 }
 
 /**
- * Builds a minimal RGBA PNG directly from a QR matrix.
- * No Sharp, no Canvas, no dependencies beyond zlib (built-in Node).
- * Extremely fast for square QR codes.
+ * Builds a minimal PNG directly from a QR modules object.
+ * qrModules = qrData.modules  (has .size, .data, .get(r,c))
  */
-function buildRawPng(qrData, qrWidth, marginX, marginY, darkRgba, lightRgba) {
-    const { modules, size } = qrData.modules;
-    const totalCols = size + 2 * marginX;
-    const totalRows = size + 2 * marginY;
-    const scale = Math.floor(qrWidth / totalCols);
+function buildRawPng(qrModules, darkRgba, lightRgba) {
+    const size = qrModules.size;
+    const totalCols = size + 2 * marginXInt;
+    const totalRows = size + 2 * marginYInt;
+    const scale = Math.max(1, Math.floor(qrWidth / totalCols));
     const imgW = totalCols * scale;
     const imgH = totalRows * scale;
 
-    const darkR = darkRgba.r, darkG = darkRgba.g, darkB = darkRgba.b, darkA = darkRgba.a;
-    const lightR = lightRgba.r, lightG = lightRgba.g, lightB = lightRgba.b, lightA = lightRgba.a;
-    const hasAlpha = darkA < 255 || lightA < 255;
+    const hasAlpha = darkRgba.a < 255 || lightRgba.a < 255;
     const channels = hasAlpha ? 4 : 3;
-    const colorType = hasAlpha ? 6 : 2; // 6 = RGBA, 2 = RGB
+    const colorType = hasAlpha ? 6 : 2; // 6=RGBA, 2=RGB
 
-    // Build raw image scanlines (filter byte 0 = None per row)
-    const rawSize = imgH * (1 + imgW * channels);
-    const raw = Buffer.allocUnsafe(rawSize);
+    // Raw scanlines: 1 filter byte + row data
+    const raw = Buffer.allocUnsafe(imgH * (1 + imgW * channels));
     let pos = 0;
 
     for (let py = 0; py < imgH; py++) {
-        raw[pos++] = 0; // PNG filter type: None
-        const qrRow = Math.floor(py / scale) - marginY;
+        raw[pos++] = 0; // filter: None
+        const qrRow = Math.floor(py / scale) - marginYInt;
 
         for (let px = 0; px < imgW; px++) {
-            const qrCol = Math.floor(px / scale) - marginX;
-
-            let dark = false;
-            if (qrRow >= 0 && qrRow < size && qrCol >= 0 && qrCol < size) {
-                dark = modules.get(qrRow, qrCol);
-            }
+            const qrCol = Math.floor(px / scale) - marginXInt;
+            const dark = (qrRow >= 0 && qrRow < size && qrCol >= 0 && qrCol < size)
+                ? qrModules.get(qrRow, qrCol)
+                : false;
 
             if (dark) {
-                raw[pos++] = darkR; raw[pos++] = darkG; raw[pos++] = darkB;
-                if (hasAlpha) raw[pos++] = darkA;
+                raw[pos++] = darkRgba.r; raw[pos++] = darkRgba.g; raw[pos++] = darkRgba.b;
+                if (hasAlpha) raw[pos++] = darkRgba.a;
             } else {
-                raw[pos++] = lightR; raw[pos++] = lightG; raw[pos++] = lightB;
-                if (hasAlpha) raw[pos++] = lightA;
+                raw[pos++] = lightRgba.r; raw[pos++] = lightRgba.g; raw[pos++] = lightRgba.b;
+                if (hasAlpha) raw[pos++] = lightRgba.a;
             }
         }
     }
 
-    // Deflate the raw scanlines (zlib sync – fast with small input)
     const compressed = zlib.deflateSync(raw, { level: 1 }); // level 1 = fastest
 
-    // Assemble PNG
     const ihdr = Buffer.allocUnsafe(13);
     ihdr.writeUInt32BE(imgW, 0);
     ihdr.writeUInt32BE(imgH, 4);
-    ihdr[8] = 8;        // bit depth
-    ihdr[9] = colorType;
-    ihdr[10] = 0; ihdr[11] = 0; ihdr[12] = 0;
+    ihdr[8] = 8; ihdr[9] = colorType; ihdr[10] = 0; ihdr[11] = 0; ihdr[12] = 0;
 
     return Buffer.concat([
         Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), // PNG signature
@@ -144,19 +133,18 @@ function buildRawPng(qrData, qrWidth, marginX, marginY, darkRgba, lightRgba) {
     ]);
 }
 
-// ─── SVG-based path (custom styles / logo / text) ────────────────────────
-function isFinder(r, c, size) {
+// ─── Custom SVG path (rounded / dots / logo / text) ──────────────────────
+function isFinderZone(r, c, size) {
     return (r < 7 && c < 7) || (r < 7 && c >= size - 7) || (r >= size - 7 && c < 7);
 }
 
-async function processCustom(serial, qrData) {
-    const { modules, size } = qrData.modules;
-    const qrWidth = parseInt(width);
+async function processCustom(serial, qrModules) {
+    const size = qrModules.size;
     const totalQRSizeX = size + 2 * marginXInt;
     const totalQRSizeY = size + 2 * marginYInt;
     const shapes = [];
 
-    // Eyes
+    // Finder pattern eyes
     const eyes = [{ r: 0, c: 0 }, { r: 0, c: size - 7 }, { r: size - 7, c: 0 }];
     for (const eye of eyes) {
         if (eyeStyle === 'rounded') {
@@ -168,11 +156,11 @@ async function processCustom(serial, qrData) {
         }
     }
 
-    // Modules
+    // Data modules
     for (let r = 0; r < size; r++) {
         for (let c = 0; c < size; c++) {
-            if (isFinder(r, c, size)) continue;
-            if (modules.get(r, c)) {
+            if (isFinderZone(r, c, size)) continue;
+            if (qrModules.get(r, c)) {
                 if (moduleStyle === 'dots') {
                     shapes.push(`<circle cx="${c + marginXInt + 0.5}" cy="${r + marginYInt + 0.5}" r="0.4" fill="${colorDark}"/>`);
                 } else if (moduleStyle === 'rounded') {
@@ -217,35 +205,36 @@ async function processCustom(serial, qrData) {
         .toBuffer();
 }
 
-// ─── Main record processor ────────────────────────────────────────────────
+// ─── Detect fast vs custom path ───────────────────────────────────────────
 const isSimplePath = (moduleStyle === 'square' && eyeStyle === 'square' && !logoDataUri && !shouldShowText);
-const qrWidth = parseInt(width);
 
-// Pre-parse colours once
-const darkRgba  = hexToRgba(colorDark);
-const lightHex  = (actualColorLight === 'transparent') ? '#ffffff00' : actualColorLight;
+// Pre-parse colours once per worker
+const darkRgba = hexToRgba(colorDark);
+const lightHex = (actualColorLight === 'transparent') ? '#ffffff00' : actualColorLight;
 const lightRgba = hexToRgba(lightHex);
 
+// ─── Per-record processor ─────────────────────────────────────────────────
 async function processRecord(serial) {
     const qrData = QRCode.create(serial, { errorCorrectionLevel });
+    const qrModules = qrData.modules; // { size, data, reservedBit, get(r,c) }
 
     if (isSimplePath) {
         if (format === 'png') {
-            // ⚡ ULTRA FAST: custom raw PNG, no Sharp at all
-            return buildRawPng(qrData, qrWidth, marginXInt, marginYInt, darkRgba, lightRgba);
+            // ⚡ Ultra-fast: custom raw PNG encoder, no Sharp at all
+            return buildRawPng(qrModules, darkRgba, lightRgba);
         } else {
-            // JPEG still needs Sharp (PNG→JPEG conversion)
-            const pngBuf = buildRawPng(qrData, qrWidth, marginXInt, marginYInt, darkRgba, { ...lightRgba, a: 255 });
+            // JPEG: build PNG first, then Sharp converts to JPEG
+            const pngBuf = buildRawPng(qrModules, darkRgba, { ...lightRgba, a: 255 });
             return await sharp(pngBuf).jpeg({ quality: 90 }).toBuffer();
         }
     }
 
-    // Custom: rounded/dots/logo/text
-    return await processCustom(serial, qrData);
+    // Custom styles / logo / text
+    return await processCustom(serial, qrModules);
 }
 
 // ─── Batch runner ─────────────────────────────────────────────────────────
-const INTERNAL_CONCURRENCY = isSimplePath ? 64 : 12; // Higher concurrency for fast path
+const INTERNAL_CONCURRENCY = isSimplePath ? 64 : 12;
 
 (async () => {
     for (let i = 0; i < records.length; i += INTERNAL_CONCURRENCY) {
@@ -263,6 +252,7 @@ const INTERNAL_CONCURRENCY = isSimplePath ? 64 : 12; // Higher concurrency for f
 
         for (const r of results) {
             if (r.ok) {
+                // Zero-copy transfer of buffer back to main thread
                 const ab = r.buf.buffer.slice(r.buf.byteOffset, r.buf.byteOffset + r.buf.byteLength);
                 parentPort.postMessage({ type: 'result', serial: r.serial, buf: ab }, [ab]);
             } else {
