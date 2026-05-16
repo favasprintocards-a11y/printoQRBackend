@@ -213,6 +213,7 @@ if (!isMainThread) {
     app.post('/api/generate', uploadFields, async (req, res) => {
         let filePath = null;
         let logoPath = null;
+        let tempZipPath = null;
         const startOverall = Date.now();
         
         try {
@@ -255,7 +256,7 @@ if (!isMainThread) {
                 validRecords.push(serialStr);
             }
 
-            console.log(`Extracted ${validRecords.length} records. Analysis took ${Date.now() - startOverall}ms`);
+            console.log(`Extracted ${validRecords.length} records in ${Date.now() - startOverall}ms`);
 
             if (process.env.MONGODB_URI) {
                 new UploadLog({
@@ -265,46 +266,33 @@ if (!isMainThread) {
                 }).save().catch(err => console.error(err));
             }
 
-            res.set('Access-Control-Expose-Headers', 'X-Total-Count, X-Success-Count, X-Skipped-Count, Content-Disposition');
-            res.set('X-Total-Count', String(range.e.r - range.s.r + 1));
-            res.set('X-Success-Count', String(validRecords.length));
-            res.set('X-Skipped-Count', String(errors.length));
-            res.attachment(`qrcodes_${Date.now()}.zip`);
-
+            // --- Build ZIP to a temp file first, then send when complete ---
+            tempZipPath = path.join(uploadDir, `zip_${Date.now()}_${Math.random().toString(36).slice(2)}.zip`);
+            const output = fs.createWriteStream(tempZipPath);
             const archive = archiver('zip', { zlib: { level: 1 } });
-            archive.on('error', (err) => {
-                console.error("Archive Error:", err);
-                if (!res.headersSent) res.status(500).send({ error: err.message });
-                else res.end();
-            });
-            archive.on('end', () => {
-                console.log(`ZIP complete. Total time: ${Date.now() - startOverall}ms`);
-                if (filePath && fs.existsSync(filePath)) fs.unlinkSync(filePath);
-                if (logoPath && fs.existsSync(logoPath)) fs.unlinkSync(logoPath);
-            });
-            res.on('close', () => {
-                if (filePath && fs.existsSync(filePath)) fs.unlinkSync(filePath);
-                if (logoPath && fs.existsSync(logoPath)) fs.unlinkSync(logoPath);
+
+            // Wait for the ZIP file to be fully written before sending
+            const zipDone = new Promise((resolve, reject) => {
+                output.on('close', resolve);
+                output.on('error', reject);
+                archive.on('error', reject);
             });
 
-            archive.pipe(res);
+            archive.pipe(output);
 
-            let reportContent = `Generation Report\n=================\nTotal Records Found: ${validRecords.length}\nSkipped/Errors: ${errors.length}\nAnalysis Time: ${Date.now() - startOverall}ms\n\n`;
-            
+            // Build report
+            let reportContent = `Generation Report\n=================\nTotal Records Found: ${validRecords.length}\nSkipped/Errors: ${errors.length}\nGeneration Time: ${Date.now() - startOverall}ms\n\n`;
             if (validRecords.length === 0) {
-                reportContent += "NOTICE: No valid QR records found. No QR codes were generated.\n\n";
+                reportContent += 'NOTICE: No valid QR records found. No QR codes were generated.\n\n';
             }
-
             if (errors.length > 0) {
-                reportContent += `Error Details:\n`;
+                reportContent += 'Error Details:\n';
                 errors.slice(0, 100).forEach(err => reportContent += `Row ${err.row}: ${err.error} (Value: "${err.value || ''}")\n`);
                 if (errors.length > 100) reportContent += `...and ${errors.length - 100} more errors.\n`;
             }
             archive.append(reportContent, { name: 'report.txt' });
 
-            if (validRecords.length === 0) {
-                archive.finalize();
-            } else {
+            if (validRecords.length > 0) {
                 // Prepare Logo Data URI in main thread
                 let logoDataUri = null;
                 if (logoPath) {
@@ -317,57 +305,88 @@ if (!isMainThread) {
                     logoDataUri = `data:image/png;base64,${logoResizedBuf.toString('base64')}`;
                 }
 
-                // Distribute to workers
+                // Distribute to workers and collect all results before finalizing
                 const numWorkers = Math.max(1, os.cpus().length);
-                const chunks = [];
                 const chunkSize = Math.ceil(validRecords.length / numWorkers);
+                const chunks = [];
                 for (let i = 0; i < validRecords.length; i += chunkSize) {
                     chunks.push(validRecords.slice(i, i + chunkSize));
                 }
 
-                let completedWorkers = 0;
                 const format = req.body.format || 'jpeg';
                 const nameCount = new Map();
 
-                for (let i = 0; i < chunks.length; i++) {
-                    const worker = new Worker(__filename, {
-                        workerData: { chunk: chunks[i], config: req.body, logoDataUri }
-                    });
+                // Process all workers and await completion
+                await Promise.all(chunks.map((chunk) => {
+                    return new Promise((resolve, reject) => {
+                        const worker = new Worker(__filename, {
+                            workerData: { chunk, config: req.body, logoDataUri }
+                        });
 
-                    worker.on('message', (msg) => {
-                        if (msg.type === 'result') {
-                            let safeName = String(msg.serial).replace(/[<>:"/\\|?*\x00-\x1F\r\n\t]/g, '-').trim();
-                            safeName = safeName.replace(/\.+$/, '') || 'qrcode';
+                        worker.on('message', (msg) => {
+                            if (msg.type === 'result') {
+                                let safeName = String(msg.serial).replace(/[<>:"/\\|?*\x00-\x1F\r\n\t]/g, '-').trim();
+                                safeName = safeName.replace(/\.+$/, '') || 'qrcode';
 
-                            let finalName = safeName;
-                            if (nameCount.has(safeName)) {
-                                const count = nameCount.get(safeName) + 1;
-                                nameCount.set(safeName, count);
-                                finalName = `${safeName}_${count}`;
-                            } else {
-                                nameCount.set(safeName, 1);
+                                let finalName = safeName;
+                                if (nameCount.has(safeName)) {
+                                    const count = nameCount.get(safeName) + 1;
+                                    nameCount.set(safeName, count);
+                                    finalName = `${safeName}_${count}`;
+                                } else {
+                                    nameCount.set(safeName, 1);
+                                }
+
+                                // msg.buf is a transferred ArrayBuffer
+                                archive.append(Buffer.from(msg.buf), { name: `${finalName}.${format === 'png' ? 'png' : 'jpg'}` });
+                            } else if (msg.type === 'error') {
+                                console.error(`Worker error on ${msg.serial}:`, msg.error);
+                            } else if (msg.type === 'done') {
+                                resolve();
                             }
+                        });
 
-                            // msg.buf is a transferred ArrayBuffer — wrap it as a Buffer
-                            const imgBuf = Buffer.from(msg.buf);
-                            archive.append(imgBuf, { name: `${finalName}.${format === 'png' ? 'png' : 'jpg'}` });
-                        } else if (msg.type === 'error') {
-                            console.error(`Worker error on ${msg.serial}:`, msg.error);
-                        } else if (msg.type === 'done') {
-                            completedWorkers++;
-                            if (completedWorkers === chunks.length) {
-                                archive.finalize();
-                            }
-                        }
+                        worker.on('error', reject);
                     });
-
-                    worker.on('error', (err) => console.error('Worker thread error:', err));
-                }
+                }));
             }
+
+            // Finalize archive — this flushes all data to the temp file
+            archive.finalize();
+
+            // Wait until the file write stream is fully closed
+            await zipDone;
+
+            const zipSize = fs.statSync(tempZipPath).size;
+            console.log(`ZIP finalized: ${zipSize} bytes, total time: ${Date.now() - startOverall}ms`);
+
+            // Now send the complete, valid ZIP file
+            res.set('Access-Control-Expose-Headers', 'X-Total-Count, X-Success-Count, X-Skipped-Count, Content-Disposition');
+            res.set('X-Total-Count', String(range.e.r - range.s.r + 1));
+            res.set('X-Success-Count', String(validRecords.length));
+            res.set('X-Skipped-Count', String(errors.length));
+            res.set('Content-Type', 'application/zip');
+            res.set('Content-Disposition', `attachment; filename="qrcodes_${Date.now()}.zip"`);
+            res.set('Content-Length', String(zipSize));
+
+            const readStream = fs.createReadStream(tempZipPath);
+            readStream.pipe(res);
+            readStream.on('end', () => {
+                // Cleanup temp zip after sending
+                if (tempZipPath && fs.existsSync(tempZipPath)) fs.unlinkSync(tempZipPath);
+                if (filePath && fs.existsSync(filePath)) fs.unlinkSync(filePath);
+                if (logoPath && fs.existsSync(logoPath)) fs.unlinkSync(logoPath);
+            });
+            readStream.on('error', (err) => {
+                console.error('Read stream error:', err);
+                if (!res.headersSent) res.status(500).json({ error: 'Failed to send ZIP file.' });
+            });
 
         } catch (error) {
             console.error('Generation Error:', error);
+            if (tempZipPath && fs.existsSync(tempZipPath)) fs.unlinkSync(tempZipPath);
             if (filePath && fs.existsSync(filePath)) fs.unlinkSync(filePath);
+            if (logoPath && fs.existsSync(logoPath)) fs.unlinkSync(logoPath);
             if (!res.headersSent) res.status(500).json({ error: 'Server error processing file.' });
         }
     });
