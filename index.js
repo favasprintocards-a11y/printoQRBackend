@@ -102,7 +102,7 @@ async function generateQRBuffer(serial, cfg, logoDataUri) {
         const buf   = Buffer.alloc(totalQRSizeX * totalQRSizeY * 4, 0);
         const cDark = hexToRgba(colorDark);
         const cLight = actualColorLight === 'transparent'
-            ? { r: 0, g: 0, b: 0, a: 0 }
+            ? { r: 255, g: 255, b: 255, a: 0 } // Use transparent white to prevent black-box bug in design software
             : hexToRgba(actualColorLight);
 
         for (let r = 0; r < totalQRSizeY; r++) {
